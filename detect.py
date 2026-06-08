@@ -1,48 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ELITE 數據獵手 — 背景偵測與 Telegram 推送
-在 GitHub Actions 上每 5 分鐘跑一次，網頁不用開、電腦不用開機。
+ELITE 數據獵手 — 背景偵測與 Telegram 推送（OKX 全資料源版）
+
+【為什麼全用 OKX】
+GitHub Actions 伺服器在美國，Binance 期貨 API 封鎖美國 IP（HTTP 451）。
+OKX 不封美國 IP，所以雲端跑必須全部用 OKX。
+（rubik 統計端點在瀏覽器 file:// 會被 CORS 擋，但從 Python 伺服器抓沒有 CORS 問題）
 
 偵測三種訊號：
-  1. 評分 >= 門檻 的做多/做空推薦（市場結構/動能/費率/多空比/CVD/相對強弱）
+  1. 評分 >= 門檻 的做多/做空推薦
   2. 背離訊號（RSI 底背離 / 頂背離）
   3. 持倉異常警報（OI 驟變 / 爆量）
-
-資料來源（全部免費、無需金鑰）：
-  - Binance 期貨：行情、K線、多空比、主動買賣量(CVD)
-  - OKX：永續合約清單、未平倉量(OI)、資金費率
-
-去重：把已推送的訊號指紋存進 state.json（由 GitHub Actions 快取/commit 保存），
-      同一訊號 COOLDOWN_HOURS 小時內不重複推。
 """
 
 import os
 import json
 import time
-import math
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 # ════════════════════════════════════════
-# 設定（可用環境變數覆蓋，或直接改這裡的預設值）
+# 設定
 # ════════════════════════════════════════
-TG_TOKEN    = os.environ.get("TG_TOKEN", "")          # Telegram Bot Token
-TG_CHAT_ID  = os.environ.get("TG_CHAT_ID", "")        # 你的 Chat ID
-SCORE_MIN   = int(os.environ.get("SCORE_MIN", "70"))  # 推薦評分門檻
-TOP_N       = int(os.environ.get("TOP_N", "40"))      # 掃描成交量前 N 大幣
-COOLDOWN_HOURS = float(os.environ.get("COOLDOWN_HOURS", "4"))  # 同訊號冷卻時間
+TG_TOKEN    = os.environ.get("TG_TOKEN", "")
+TG_CHAT_ID  = os.environ.get("TG_CHAT_ID", "")
+SCORE_MIN   = int(os.environ.get("SCORE_MIN", "70"))
+TOP_N       = int(os.environ.get("TOP_N", "40"))
+COOLDOWN_HOURS = float(os.environ.get("COOLDOWN_HOURS", "4"))
 STATE_FILE  = os.environ.get("STATE_FILE", "state.json")
 
-# 開關：要不要推某類訊號
 ENABLE_SCORE      = os.environ.get("ENABLE_SCORE", "1") == "1"
 ENABLE_DIVERGENCE = os.environ.get("ENABLE_DIVERGENCE", "1") == "1"
 ENABLE_ANOMALY    = os.environ.get("ENABLE_ANOMALY", "1") == "1"
 
-BINANCE_FAPI = "https://fapi.binance.com"
-OKX_API      = "https://www.okx.com"
-
+OKX = "https://www.okx.com"
 UA = {"User-Agent": "Mozilla/5.0 (elite-bot)"}
 
 
@@ -62,113 +55,101 @@ def http_post(url, data, timeout=15):
         return json.loads(r.read().decode())
 
 
+def okx_get(path, timeout=15):
+    try:
+        d = http_get(OKX + path, timeout=timeout)
+        if d.get("code") == "0":
+            return d.get("data", [])
+    except Exception as e:
+        print(f"OKX {path[:45]} 失敗: {e}")
+    return []
+
+
 # ════════════════════════════════════════
-# 資料抓取
+# 資料抓取（全 OKX）
 # ════════════════════════════════════════
-def get_binance_tickers():
-    """全市場 24h 行情。回傳 {SYMBOL: {...}}"""
-    data = http_get(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr")
+def get_tickers():
+    data = okx_get("/api/v5/market/tickers?instType=SWAP")
     out = {}
     for t in data:
-        s = t.get("symbol", "")
-        if not s.endswith("USDT"):
+        inst = t.get("instId", "")
+        if not inst.endswith("-USDT-SWAP"):
             continue
-        if "_" in s:  # 過濾交割合約
-            continue
-        out[s] = {
-            "symbol": s,
-            "price": float(t.get("lastPrice", 0) or 0),
-            "chg24h": float(t.get("priceChangePercent", 0) or 0),
-            "vol": float(t.get("quoteVolume", 0) or 0),
-            "high": float(t.get("highPrice", 0) or 0),
-            "low": float(t.get("lowPrice", 0) or 0),
+        sym = inst.replace("-USDT-SWAP", "")
+        last = float(t.get("last", 0) or 0)
+        open24 = float(t.get("open24h", 0) or 0)
+        chg24h = ((last - open24) / open24 * 100) if open24 > 0 else 0
+        out[sym + "USDT"] = {
+            "symbol": sym + "USDT", "sym": sym, "inst": inst,
+            "price": last, "chg24h": chg24h,
+            "vol": float(t.get("volCcy24h", 0) or 0),
+            "high": float(t.get("high24h", 0) or 0),
+            "low": float(t.get("low24h", 0) or 0),
         }
     return out
 
 
-def get_okx_swaps():
-    """OKX 有永續合約的幣種集合（純符號，如 BTC）"""
-    try:
-        d = http_get(f"{OKX_API}/api/v5/public/instruments?instType=SWAP")
-        s = set()
-        for it in d.get("data", []):
-            inst = it.get("instId", "")
-            if inst.endswith("-USDT-SWAP"):
-                s.add(inst.replace("-USDT-SWAP", ""))
-        return s
-    except Exception as e:
-        print("OKX swaps 抓取失敗:", e)
-        return set()
+def get_oi():
+    data = okx_get("/api/v5/public/open-interest?instType=SWAP")
+    out = {}
+    for it in data:
+        inst = it.get("instId", "")
+        if inst.endswith("-USDT-SWAP"):
+            sym = inst.replace("-USDT-SWAP", "") + "USDT"
+            out[sym] = float(it.get("oiUsd", 0) or 0)
+    return out
 
 
-def get_okx_oi():
-    """OKX 全市場真實未平倉量。回傳 {SYMBOL_USDT: oiUsd}"""
-    try:
-        d = http_get(f"{OKX_API}/api/v5/public/open-interest?instType=SWAP")
-        out = {}
-        for it in d.get("data", []):
-            inst = it.get("instId", "")
-            if inst.endswith("-USDT-SWAP"):
-                sym = inst.replace("-USDT-SWAP", "") + "USDT"
-                out[sym] = float(it.get("oiUsd", 0) or 0)
-        return out
-    except Exception as e:
-        print("OKX OI 抓取失敗:", e)
-        return {}
-
-
-def get_okx_funding(sym):
-    """單幣 OKX 資金費率"""
-    try:
-        d = http_get(f"{OKX_API}/api/v5/public/funding-rate?instId={sym}-USDT-SWAP")
-        data = d.get("data", [])
-        if data and data[0].get("fundingRate"):
-            return float(data[0]["fundingRate"])
-    except Exception:
-        pass
+def get_funding(sym):
+    data = okx_get(f"/api/v5/public/funding-rate?instId={sym}-USDT-SWAP")
+    if data and data[0].get("fundingRate"):
+        return float(data[0]["fundingRate"])
     return None
 
 
-def get_binance_ls(sym):
-    """大戶持倉多空比（最近一筆）。回傳 longRatio(0~1) 或 None"""
-    try:
-        url = f"{BINANCE_FAPI}/futures/data/topLongShortPositionRatio?symbol={sym}USDT&period=15m&limit=1"
-        d = http_get(url)
-        if d:
-            return float(d[-1]["longAccount"])
-    except Exception:
-        pass
+def get_long_short(sym):
+    """多空帳戶比。data: [[ts, ratio(多/空)], ...] → 回傳多方占比 0~1"""
+    data = okx_get(f"/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy={sym}&period=5m&limit=1")
+    if data:
+        try:
+            ratio = float(data[0][1])
+            return ratio / (1 + ratio) if ratio > 0 else 0.5
+        except Exception:
+            pass
     return None
 
 
-def get_binance_cvd(sym):
-    """近 1 小時 CVD 淨買賣偏向 %。回傳 deltaPct 或 None"""
+def get_cvd(sym):
+    """主動買賣量近1H淨偏向%。data: [[ts, sellVol, buyVol], ...]"""
+    data = okx_get(f"/api/v5/rubik/stat/taker-volume?ccy={sym}&instType=SWAP&period=5m&limit=12")
+    if not data:
+        return None
     try:
-        url = f"{BINANCE_FAPI}/futures/data/takerlongshortRatio?symbol={sym}USDT&period=5m&limit=12"
-        d = http_get(url)
-        if not d:
-            return None
-        buy = sum(float(k["buyVol"]) for k in d)
-        sell = sum(float(k["sellVol"]) for k in d)
+        buy = sum(float(r[2]) for r in data)
+        sell = sum(float(r[1]) for r in data)
         tot = buy + sell
         return (buy - sell) / tot * 100 if tot > 0 else 0
     except Exception:
         return None
 
 
-def get_klines(sym, interval="1h", limit=100):
-    """Binance K線。回傳 [{o,h,l,c,v}] 由舊到新"""
-    try:
-        url = f"{BINANCE_FAPI}/fapi/v1/klines?symbol={sym}USDT&interval={interval}&limit={limit}"
-        d = http_get(url)
-        return [{"o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
-                 "c": float(k[4]), "v": float(k[5])} for k in d]
-    except Exception:
+def get_klines(sym, bar="1H", limit=100):
+    data = okx_get(f"/api/v5/market/candles?instId={sym}-USDT-SWAP&bar={bar}&limit={limit}")
+    if not data:
         return None
+    now = time.time() * 1000
+    out = []
+    for k in data:
+        t = float(k[0])
+        if t + 3600000 <= now:
+            out.append({"o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
+                        "c": float(k[4]), "v": float(k[5])})
+    out.reverse()
+    return out
 
 
 # ════════════════════════════════════════
-# 指標計算
+# 指標計算（與網頁版一致）
 # ════════════════════════════════════════
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -213,7 +194,6 @@ def find_pivots(arr, wl=3, wr=2, kind="low"):
 
 
 def detect_divergence(candles):
-    """偵測 RSI 背離。回傳 dict 或 None"""
     if not candles or len(candles) < 30:
         return None
     closes = [c["c"] for c in candles]
@@ -226,7 +206,6 @@ def detect_divergence(candles):
     n = len(candles)
     recent_cut = n - 10
 
-    # 底背離
     low_piv = [i for i in find_pivots(lows, 3, 2, "low") if rsi[i] is not None]
     if len(low_piv) >= 2:
         recent = [i for i in low_piv if i >= recent_cut]
@@ -236,16 +215,15 @@ def detect_divergence(candles):
             if prior:
                 p1 = min(prior, key=lambda i: lows[i])
                 if lows[p2] < lows[p1] and rsi[p2] > rsi[p1] + 1 and rsi[p2] < 55:
-                    vol_shrink = vols[p2] < vols[p1]
+                    vs = vols[p2] < vols[p1]
                     gap = rsi[p2] - rsi[p1]
-                    strength = min(100, round(gap * 2.5 + (20 if vol_shrink else 0) +
+                    strength = min(100, round(gap * 2.5 + (20 if vs else 0) +
                                               (15 if rsi[p2] < 35 else 0) + 25))
                     return {"type": "long", "label": "底背離", "emoji": "↗",
                             "strength": strength,
                             "desc": f"價創新低但 RSI 回升（{rsi[p1]:.0f}→{rsi[p2]:.0f}）"
-                                    f"{'，量縮確認' if vol_shrink else ''}"}
+                                    f"{'，量縮確認' if vs else ''}"}
 
-    # 頂背離
     high_piv = [i for i in find_pivots(highs, 3, 2, "high") if rsi[i] is not None]
     if len(high_piv) >= 2:
         recent = [i for i in high_piv if i >= recent_cut]
@@ -255,23 +233,20 @@ def detect_divergence(candles):
             if prior:
                 p1 = max(prior, key=lambda i: highs[i])
                 if highs[p2] > highs[p1] and rsi[p2] < rsi[p1] - 1 and rsi[p2] > 45:
-                    vol_shrink = vols[p2] < vols[p1]
+                    vs = vols[p2] < vols[p1]
                     gap = rsi[p1] - rsi[p2]
-                    strength = min(100, round(gap * 2.5 + (20 if vol_shrink else 0) +
+                    strength = min(100, round(gap * 2.5 + (20 if vs else 0) +
                                               (15 if rsi[p2] > 65 else 0) + 25))
                     return {"type": "short", "label": "頂背離", "emoji": "↘",
                             "strength": strength,
                             "desc": f"價創新高但 RSI 走弱（{rsi[p1]:.0f}→{rsi[p2]:.0f}）"
-                                    f"{'，量縮確認' if vol_shrink else ''}"}
+                                    f"{'，量縮確認' if vs else ''}"}
     return None
 
 
 def compute_score(side, chg24h, oi_chg1h, fr, long_ratio, cvd_pct, rs):
-    """還原網頁的 7 項評分（滿分 100）"""
     is_long = side == "long"
     pts = 0
-
-    # 1. 市場結構 OI×價格×CVD (max 30)
     oi_up, oi_dn = oi_chg1h > 0.3, oi_chg1h < -0.3
     cvd_buy, cvd_sell = cvd_pct > 3, cvd_pct < -3
     if is_long:
@@ -304,37 +279,24 @@ def compute_score(side, chg24h, oi_chg1h, fr, long_ratio, cvd_pct, rs):
             s = min(15, s + 3)
         elif cvd_buy:
             s = max(0, s - 3)
-    pts += s * 2  # max 30
-
-    # 2. 動能 24H (max 15)
+    pts += s * 2
     mom = chg24h if is_long else -chg24h
     pts += max(0, min(15, mom * 1.5))
-
-    # 3. 資金費率 (max 10)
     if is_long:
         pts += 10 if fr < -0.005 else 7 if fr < 0 else 4 if fr < 0.005 else 1
     else:
         pts += 10 if fr > 0.01 else 7 if fr > 0.003 else 4 if fr > 0 else 1
-
-    # 4. 多空比 (max 10)
     if is_long:
         pts += 10 if long_ratio < 0.4 else 7 if long_ratio < 0.5 else 4 if long_ratio < 0.6 else 1
     else:
         pts += 10 if long_ratio > 0.6 else 7 if long_ratio > 0.5 else 4 if long_ratio > 0.4 else 1
-
-    # 5. CVD 方向 (max 10)
     if is_long:
         pts += 10 if cvd_pct > 10 else 6 if cvd_pct > 3 else 3 if cvd_pct > 0 else 0
     else:
         pts += 10 if cvd_pct < -10 else 6 if cvd_pct < -3 else 3 if cvd_pct < 0 else 0
-
-    # 6. 相對強弱 vs BTC (max 15)
     r = rs if is_long else -rs
     pts += max(0, min(15, 7.5 + r * 1.5))
-
-    # 7. OI 規模分 (max 10) — 簡化給固定中間值
     pts += 6
-
     return round(min(100, pts))
 
 
@@ -359,9 +321,7 @@ def save_state(state):
 
 def already_pushed(state, key):
     ts = state.get(key)
-    if not ts:
-        return False
-    return (time.time() - ts) < COOLDOWN_HOURS * 3600
+    return bool(ts) and (time.time() - ts) < COOLDOWN_HOURS * 3600
 
 
 def mark_pushed(state, key):
@@ -373,15 +333,13 @@ def mark_pushed(state, key):
 # ════════════════════════════════════════
 def send_telegram(text):
     if not TG_TOKEN or not TG_CHAT_ID:
-        print("⚠ 未設定 TG_TOKEN / TG_CHAT_ID，略過推送。訊息內容：\n", text)
+        print("⚠ 未設定 TG_TOKEN / TG_CHAT_ID，略過推送。內容：\n", text)
         return False
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         http_post(url, {
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
+            "chat_id": TG_CHAT_ID, "text": text,
+            "parse_mode": "HTML", "disable_web_page_preview": "true",
         })
         return True
     except Exception as e:
@@ -393,57 +351,48 @@ def send_telegram(text):
 # 主流程
 # ════════════════════════════════════════
 def main():
-    print("=== ELITE 偵測開始", datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"), "(台北) ===")
+    now_tpe = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"=== ELITE 偵測開始 {now_tpe} (台北) ===")
     state = load_state()
 
-    tickers = get_binance_tickers()
-    print(f"Binance 行情: {len(tickers)} 個")
-    okx_swaps = get_okx_swaps()
-    print(f"OKX 永續: {len(okx_swaps)} 個")
-    okx_oi = get_okx_oi()
+    tickers = get_tickers()
+    print(f"OKX 行情: {len(tickers)} 個 SWAP")
+    if not tickers:
+        print("⚠ 抓不到行情，結束")
+        return
+    oi_map = get_oi()
     btc_chg = tickers.get("BTCUSDT", {}).get("chg24h", 0)
 
-    # 取成交量前 N 大、OKX 有合約的幣
-    cands = [t for s, t in tickers.items()
-             if s.replace("USDT", "") in okx_swaps and t["price"] > 0]
+    cands = [t for t in tickers.values() if t["price"] > 0]
     cands.sort(key=lambda t: t["vol"], reverse=True)
     cands = cands[:TOP_N]
     print(f"掃描候選: {len(cands)} 個")
 
-    # OI 變化快照（用 state 裡上次的 OI 比對）
     oi_hist = state.get("_oi_snapshot", {})
     new_oi_snap = {}
-
-    msgs = []  # 要推送的訊息
+    msgs = []
 
     for t in cands:
-        sym = t["symbol"].replace("USDT", "")
+        sym = t["sym"]
         price = t["price"]
         chg24h = t["chg24h"]
-        oi_usd = okx_oi.get(t["symbol"], 0)
+        oi_usd = oi_map.get(t["symbol"], 0)
 
-        # OI 1H 變化（與上次快照比對；GitHub Actions 每5分鐘跑，約12次=1H）
         oi_chg1h = 0
         prev = oi_hist.get(sym)
         if prev and prev.get("oi", 0) > 0:
-            age_min = (time.time() - prev.get("ts", 0)) / 60
-            if age_min >= 40:  # 至少40分鐘前的快照
+            if (time.time() - prev.get("ts", 0)) / 60 >= 40:
                 oi_chg1h = (oi_usd - prev["oi"]) / prev["oi"] * 100
-        # 累積快照：間隔≥8分鐘才更新基準
         if not prev or (time.time() - prev.get("ts", 0)) / 60 >= 8:
             new_oi_snap[sym] = {"oi": oi_usd, "ts": time.time()}
         else:
             new_oi_snap[sym] = prev
 
-        # ── 1. 持倉異常警報（OI驟變/爆量）──
+        # 1. 持倉異常
         if ENABLE_ANOMALY:
-            avg_vol = sum(c["vol"] for c in cands) / max(1, len(cands)) if False else None
-            vol_ratio = 0
-            # 用 24h 量 vs 候選平均粗估爆量
             allvol = [c["vol"] for c in cands]
-            if allvol:
-                avgv = sum(allvol) / len(allvol)
-                vol_ratio = t["vol"] / avgv if avgv > 0 else 0
+            avgv = sum(allvol) / len(allvol) if allvol else 0
+            vol_ratio = t["vol"] / avgv if avgv > 0 else 0
             anomalies = []
             if abs(oi_chg1h) > 8:
                 anomalies.append(f"OI 1H {oi_chg1h:+.1f}%")
@@ -462,13 +411,14 @@ def main():
                     )
                     mark_pushed(state, key)
 
-        # ── 2. 評分推薦 ──
+        # 2. 評分推薦
         if ENABLE_SCORE:
-            fr = get_okx_funding(sym) or (chg24h * 0.0008)
-            lr = get_binance_ls(sym)
+            fr = get_funding(sym)
+            fr = fr if fr is not None else (chg24h * 0.0008)
+            lr = get_long_short(sym)
             lr = lr if lr is not None else 0.5
-            cvd = get_binance_cvd(sym)
-            cvd = cvd if cvd is not None else chg24h * 2
+            cvd = get_cvd(sym)
+            cvd = cvd if cvd is not None else (chg24h * 2)
             rs = chg24h - btc_chg
             side = "long" if chg24h >= 0 else "short"
             score = compute_score(side, chg24h, oi_chg1h, fr, lr, cvd, rs)
@@ -485,9 +435,9 @@ def main():
                     )
                     mark_pushed(state, key)
 
-        # ── 3. 背離訊號 ──
+        # 3. 背離
         if ENABLE_DIVERGENCE:
-            candles = get_klines(sym, "1h", 100)
+            candles = get_klines(sym, "1H", 100)
             div = detect_divergence(candles)
             if div and div["strength"] >= 50:
                 key = f"div:{sym}:{div['type']}"
@@ -501,20 +451,15 @@ def main():
                     )
                     mark_pushed(state, key)
 
-        time.sleep(0.1)  # 輕微限流
+        time.sleep(0.12)
 
-    # 保存 OI 快照
     state["_oi_snapshot"] = new_oi_snap
 
-    # 推送（合併成批，避免洗版；每則之間留空行）
     print(f"本次偵測到 {len(msgs)} 則新訊號")
     if msgs:
         header = f"🎯 <b>ELITE 數據獵手</b> · {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M')}\n" + "─" * 18
-        # 一則訊息最多塞 8 個訊號，避免超過 Telegram 長度上限
         for i in range(0, len(msgs), 8):
-            batch = msgs[i:i + 8]
-            text = header + "\n\n" + "\n\n".join(batch)
-            send_telegram(text)
+            send_telegram(header + "\n\n" + "\n\n".join(msgs[i:i + 8]))
             time.sleep(1)
 
     save_state(state)
