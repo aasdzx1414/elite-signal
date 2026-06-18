@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ELITE 數據獵手 — 背景偵測與 Telegram 推送（OKX 全資料源版）
+AlphaForge PRO — 雲端訊號偵測與 Telegram 推送（OKX 全資料源版）
 
 【為什麼全用 OKX】
 GitHub Actions 伺服器在美國，Binance 期貨 API 封鎖美國 IP（HTTP 451）。
@@ -36,7 +36,7 @@ ENABLE_DIVERGENCE = os.environ.get("ENABLE_DIVERGENCE", "1") == "1"
 ENABLE_ANOMALY    = os.environ.get("ENABLE_ANOMALY", "1") == "1"
 
 OKX = "https://www.okx.com"
-UA = {"User-Agent": "Mozilla/5.0 (elite-bot)"}
+UA = {"User-Agent": "Mozilla/5.0 (alphaforge-bot)"}
 
 
 # ════════════════════════════════════════
@@ -193,6 +193,22 @@ def find_pivots(arr, wl=3, wr=2, kind="low"):
     return piv
 
 
+def calc_true_atr(candles, period=14):
+    """真實 ATR（含跳空 True Range）— 與網頁版 calcTrueATR 一致"""
+    if not candles or len(candles) < period + 1:
+        if candles:
+            recent = candles[-period:]
+            return sum(c["h"] - c["l"] for c in recent) / len(recent)
+        return 0
+    total = 0
+    for i in range(len(candles) - period, len(candles)):
+        c = candles[i]
+        prev_c = candles[i - 1]["c"] if i > 0 else c["o"]
+        tr = max(c["h"] - c["l"], abs(c["h"] - prev_c), abs(prev_c - c["l"]))
+        total += tr
+    return total / period
+
+
 def detect_divergence(candles):
     if not candles or len(candles) < 30:
         return None
@@ -214,13 +230,25 @@ def detect_divergence(candles):
             prior = [i for i in low_piv if i <= p2 - 3]
             if prior:
                 p1 = min(prior, key=lambda i: lows[i])
-                if lows[p2] < lows[p1] and rsi[p2] > rsi[p1] + 1 and rsi[p2] < 55:
+                # RSI 禁區（與網頁版一致）：前低 RSI<15 = 崩盤動能，不接刀
+                if (lows[p2] < lows[p1] and rsi[p2] > rsi[p1] + 1
+                        and rsi[p2] < 55 and rsi[p1] >= 15):
                     vs = vols[p2] < vols[p1]
                     gap = rsi[p2] - rsi[p1]
+                    # K 線時效 TTL：超過 4 根未啟動 = Alpha 衰退，扣強度
+                    bars_ago = n - 1 - p2
+                    stale = bars_ago > 4
+                    stale_penalty = min(25, (bars_ago - 4) * 4) if stale else 0
                     strength = min(100, round(gap * 2.5 + (20 if vs else 0) +
-                                              (15 if rsi[p2] < 35 else 0) + 25))
+                                              (15 if rsi[p2] < 35 else 0) + 25 - stale_penalty))
+                    # 真 ATR 止損
+                    atr = calc_true_atr(candles, 14)
+                    entry = closes[-1]
+                    sl = min(lows[p2], lows[p1]) - atr * 0.5
+                    tp = entry + (entry - sl)
                     return {"type": "long", "label": "底背離", "emoji": "↗",
-                            "strength": strength,
+                            "strength": strength, "stale": stale, "bars_ago": bars_ago,
+                            "entry": entry, "sl": sl, "tp": tp,
                             "desc": f"價創新低但 RSI 回升（{rsi[p1]:.0f}→{rsi[p2]:.0f}）"
                                     f"{'，量縮確認' if vs else ''}"}
 
@@ -232,16 +260,59 @@ def detect_divergence(candles):
             prior = [i for i in high_piv if i <= p2 - 3]
             if prior:
                 p1 = max(prior, key=lambda i: highs[i])
-                if highs[p2] > highs[p1] and rsi[p2] < rsi[p1] - 1 and rsi[p2] > 45:
+                # RSI 禁區：前高 RSI>85 = 超強動能，禁止做空
+                if (highs[p2] > highs[p1] and rsi[p2] < rsi[p1] - 1
+                        and rsi[p2] > 45 and rsi[p1] <= 85):
                     vs = vols[p2] < vols[p1]
                     gap = rsi[p1] - rsi[p2]
+                    bars_ago = n - 1 - p2
+                    stale = bars_ago > 4
+                    stale_penalty = min(25, (bars_ago - 4) * 4) if stale else 0
                     strength = min(100, round(gap * 2.5 + (20 if vs else 0) +
-                                              (15 if rsi[p2] > 65 else 0) + 25))
+                                              (15 if rsi[p2] > 65 else 0) + 25 - stale_penalty))
+                    atr = calc_true_atr(candles, 14)
+                    entry = closes[-1]
+                    sl = max(highs[p2], highs[p1]) + atr * 0.5
+                    tp = entry - (sl - entry)
                     return {"type": "short", "label": "頂背離", "emoji": "↘",
-                            "strength": strength,
+                            "strength": strength, "stale": stale, "bars_ago": bars_ago,
+                            "entry": entry, "sl": sl, "tp": tp,
                             "desc": f"價創新高但 RSI 走弱（{rsi[p1]:.0f}→{rsi[p2]:.0f}）"
                                     f"{'，量縮確認' if vs else ''}"}
     return None
+
+
+def detect_squeeze(oi_chg1h, fr):
+    """軋空/殺多偵測 — 與網頁 squeeze_long/squeeze_short 邏輯一致
+    OI 暴增 + 極端費率 = 連環爆倉前兆
+    """
+    if oi_chg1h is None or fr is None:
+        return None
+    if oi_chg1h > 8 and fr < -0.0005:  # OI暴增 + 極端負費率 → 軋空
+        return {"type": "long", "label": "潛在軋空", "emoji": "🔥",
+                "desc": f"OI 1H +{oi_chg1h:.1f}% + 費率 {fr*100:.3f}% · 空軍過度擁擠"}
+    if oi_chg1h > 8 and fr > 0.0005:   # OI暴增 + 極端正費率 → 殺多
+        return {"type": "short", "label": "潛在殺多", "emoji": "🔥",
+                "desc": f"OI 1H +{oi_chg1h:.1f}% + 費率 +{fr*100:.3f}% · 多軍過度擁擠"}
+    return None
+
+
+def classify_regime(chg24h, oi_chg1h):
+    """四象限分類 — 與網頁 _oiRegimes 一致
+    返回 (regime, label, is_warning) — 警告型代表逆勢風險
+    """
+    if oi_chg1h is None:
+        oi_chg1h = 0
+    oi_up = oi_chg1h > 1
+    oi_dn = oi_chg1h < -1
+    if chg24h >= 0:
+        if oi_up: return ("long_buildup", "多頭建倉", False)
+        if oi_dn: return ("short_squeeze", "空頭爆倉", True)   # 黃燈：別追多
+        return ("long_weak", "多頭(OI平)", False)
+    else:
+        if oi_up: return ("short_buildup", "空頭壓頂", False)
+        if oi_dn: return ("long_squeeze", "多頭踩踏", True)    # 黃燈：別追空
+        return ("short_weak", "空頭(OI平)", False)
 
 
 def compute_score(side, chg24h, oi_chg1h, fr, long_ratio, cvd_pct, rs):
@@ -352,7 +423,7 @@ def send_telegram(text):
 # ════════════════════════════════════════
 def main():
     now_tpe = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"=== ELITE 偵測開始 {now_tpe} (台北) ===")
+    print(f"=== AlphaForge 偵測開始 {now_tpe} (台北) ===")
     state = load_state()
 
     tickers = get_tickers()
@@ -388,6 +459,10 @@ def main():
         else:
             new_oi_snap[sym] = prev
 
+        # 計算四象限（給其他訊號帶風險標籤用）
+        regime, regime_label, regime_warn = classify_regime(chg24h, oi_chg1h)
+        regime_tag = f"⚠️{regime_label}" if regime_warn else regime_label
+
         # 1. 持倉異常
         if ENABLE_ANOMALY:
             allvol = [c["vol"] for c in cands]
@@ -404,8 +479,8 @@ def main():
                 if not already_pushed(state, key):
                     side_txt = "🟢看漲" if chg24h >= 0 else "🔴看跌"
                     msgs.append(
-                        f"⚠️ <b>持倉異常 · {sym}</b> {side_txt}\n"
-                        f"價格 ${price:g}（24H {chg24h:+.2f}%）\n"
+                        f"⚠️ <b>持倉異常 · {sym}</b> {side_txt} ｜ <i>{regime_tag}</i>\n"
+                        f"價格 <code>${price:g}</code>（24H {chg24h:+.2f}%）\n"
                         f"異常：{' / '.join(anomalies)}\n"
                         f"<a href=\"https://www.tradingview.com/chart/?symbol=OKX:{sym}USDT.P\">📈 TradingView</a>"
                     )
@@ -426,11 +501,30 @@ def main():
                 key = f"score:{sym}:{side}"
                 if not already_pushed(state, key):
                     side_txt = "🟢 做多推薦" if side == "long" else "🔴 做空推薦"
+                    # 費率收益標記
+                    fr_tag = ""
+                    if abs(fr) > 0.0003:
+                        earning = (side == "long" and fr < 0) or (side == "short" and fr > 0)
+                        fr_tag = f" · {'🟢淨賺費率' if earning else '🔴付費率'}"
                     msgs.append(
-                        f"{side_txt} · <b>{sym}</b>（評分 {score}）\n"
-                        f"價格 ${price:g}（24H {chg24h:+.2f}%）\n"
-                        f"OI 1H {oi_chg1h:+.1f}% · 費率 {fr*100:+.3f}% · "
+                        f"{side_txt} · <b>{sym}</b>（評分 {score}）｜ <i>{regime_tag}</i>\n"
+                        f"價格 <code>${price:g}</code>（24H {chg24h:+.2f}%）\n"
+                        f"OI 1H {oi_chg1h:+.1f}% · 費率 {fr*100:+.3f}%{fr_tag}\n"
                         f"多空 {lr*100:.0f}% · CVD {cvd:+.1f}%\n"
+                        f"<a href=\"https://www.tradingview.com/chart/?symbol=OKX:{sym}USDT.P\">📈 TradingView</a>"
+                    )
+                    mark_pushed(state, key)
+
+            # 2.5 軋空/殺多警示（獨立訊號）
+            sq = detect_squeeze(oi_chg1h, fr)
+            if sq:
+                key = f"squeeze:{sym}:{sq['type']}"
+                if not already_pushed(state, key):
+                    side_txt = "🟢 做多參考（軋空）" if sq["type"] == "long" else "🔴 做空參考（殺多）"
+                    msgs.append(
+                        f"{sq['emoji']} <b>{sq['label']} · {sym}</b> {side_txt}\n"
+                        f"價格 <code>${price:g}</code>（24H {chg24h:+.2f}%）\n"
+                        f"{sq['desc']}\n"
                         f"<a href=\"https://www.tradingview.com/chart/?symbol=OKX:{sym}USDT.P\">📈 TradingView</a>"
                     )
                     mark_pushed(state, key)
@@ -439,14 +533,16 @@ def main():
         if ENABLE_DIVERGENCE:
             candles = get_klines(sym, "1H", 100)
             div = detect_divergence(candles)
-            if div and div["strength"] >= 50:
+            # 時效衰退的不推送（避免推殭屍訊號）
+            if div and div["strength"] >= 50 and not div.get("stale"):
                 key = f"div:{sym}:{div['type']}"
                 if not already_pushed(state, key):
                     side_txt = "🟢 做多參考" if div["type"] == "long" else "🔴 做空參考"
                     msgs.append(
                         f"{div['emoji']} <b>{div['label']} · {sym}</b>（強度 {div['strength']}）{side_txt}\n"
-                        f"價格 ${price:g}（24H {chg24h:+.2f}%）\n"
+                        f"價格 <code>${price:g}</code>（24H {chg24h:+.2f}%）｜ <i>{regime_tag}</i>\n"
                         f"{div['desc']}\n"
+                        f"建議進場 <code>{div['entry']:g}</code> · 止損 <code>{div['sl']:g}</code> · 止盈 <code>{div['tp']:g}</code>\n"
                         f"<a href=\"https://www.tradingview.com/chart/?symbol=OKX:{sym}USDT.P\">📈 TradingView</a>"
                     )
                     mark_pushed(state, key)
@@ -457,7 +553,8 @@ def main():
 
     print(f"本次偵測到 {len(msgs)} 則新訊號")
     if msgs:
-        header = f"🎯 <b>ELITE 數據獵手</b> · {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M')}\n" + "─" * 18
+        header = (f"⚡ <b>AlphaForge PRO</b> · {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M')}\n"
+                  f"<i>Resonance Engine · Cloud Radar</i>\n" + "─" * 18)
         for i in range(0, len(msgs), 8):
             send_telegram(header + "\n\n" + "\n\n".join(msgs[i:i + 8]))
             time.sleep(1)
@@ -468,3 +565,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
